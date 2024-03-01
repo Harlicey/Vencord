@@ -281,9 +281,13 @@ async function runtime(token: string) {
 
         // Monkey patch Logger to not log with custom css
         // @ts-ignore
+        const originalLog = Vencord.Util.Logger.prototype._log;
+        // @ts-ignore
         Vencord.Util.Logger.prototype._log = function (level, levelColor, args) {
             if (level === "warn" || level === "error")
-                console[level]("[Vencord]", this.name + ":", ...args);
+                return console[level]("[Vencord]", this.name + ":", ...args);
+
+            return originalLog.call(this, level, levelColor, args);
         };
 
         // Force enable all plugins and patches
