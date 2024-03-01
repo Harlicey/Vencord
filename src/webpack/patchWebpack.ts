@@ -22,62 +22,94 @@ import { canonicalizeReplacement } from "@utils/patches";
 import { PatchReplacement } from "@utils/types";
 
 import { traceFunction } from "../debug/Tracer";
-import { _initWebpack } from ".";
-
-let webpackChunk: any[];
+import { _initWebpack, beforeInitListeners, factoryListeners, moduleListeners, subscriptions } from ".";
 
 const logger = new Logger("WebpackInterceptor", "#8caaee");
 
-if (window[WEBPACK_CHUNK]) {
-    logger.info(`Patching ${WEBPACK_CHUNK}.push (was already existent, likely from cache!)`);
-    _initWebpack(window[WEBPACK_CHUNK]);
-    patchPush(window[WEBPACK_CHUNK]);
-} else {
-    Object.defineProperty(window, WEBPACK_CHUNK, {
-        get: () => webpackChunk,
-        set: v => {
-            if (v?.push) {
-                if (!v.push.$$vencordOriginal) {
-                    logger.info(`Patching ${WEBPACK_CHUNK}.push`);
-                    patchPush(v);
+let webpackChunk: any[];
+
+// Patch the window webpack chunk setter to monkey patch the push method before any chunks are pushed
+// This way we can patch the factory of everything being pushed to the modules array
+Object.defineProperty(window, WEBPACK_CHUNK, {
+    get: () => webpackChunk,
+    set: v => {
+        if (v?.push) {
+            if (!v.push.$$vencordOriginal) {
+                logger.info(`Patching ${WEBPACK_CHUNK}.push`);
+                patchPush(v);
+
+                // @ts-ignore
+                delete window[WEBPACK_CHUNK];
+                window[WEBPACK_CHUNK] = v;
+            }
+        }
+        webpackChunk = v;
+    },
+    configurable: true
+});
+
+// wreq.O is the webpack onChunksLoaded function
+// Discord uses it to await for all the chunks to be loaded before initializing the app
+// We monkey patch it to get immediate access to the webpack require before the app runs,
+// and to monkey patch the initialize app callback to run our listeners before doing it
+Object.defineProperty(Function.prototype, "O", {
+    set(onChunksLoaded: any) {
+        // When using react devtools or other extensions, or even when discord loads the sentry, we may also catch their webpack here.
+        // This ensures we actually got the right one
+        if (new Error().stack?.includes("discord.com") && this.p === "/assets/") {
+            logger.info("Found Webpack onChunksLoaded");
+
+            _initWebpack(this);
+
+            const originalOnChunksLoaded = onChunksLoaded.bind(this);
+            onChunksLoaded = function (result: any, chunkIds: string[], callback: () => any, priority: number) {
+                if (callback != null) {
+                    const originalCallback = callback;
+                    callback = function () {
+                        for (const beforeInitListener of beforeInitListeners) {
+                            beforeInitListener();
+                        }
+                        originalCallback();
+                    };
                 }
 
-                if (_initWebpack(v)) {
-                    logger.info("Successfully initialised Vencord webpack");
-                    // @ts-ignore
-                    delete window[WEBPACK_CHUNK];
-                    window[WEBPACK_CHUNK] = v;
-                }
-            }
-            webpackChunk = v;
-        },
-        configurable: true
-    });
+                originalOnChunksLoaded(result, chunkIds, callback, priority);
+            };
 
-    // wreq.m is the webpack module factory.
-    // normally, this is populated via webpackGlobal.push, which we patch below.
-    // However, Discord has their .m prepopulated.
-    // Thus, we use this hack to immediately access their wreq.m and patch all already existing factories
-    //
-    // Update: Discord now has TWO webpack instances. Their normal one and sentry
-    // Sentry does not push chunks to the global at all, so this same patch now also handles their sentry modules
-    Object.defineProperty(Function.prototype, "m", {
-        set(v: any) {
-            // When using react devtools or other extensions, we may also catch their webpack here.
-            // This ensures we actually got the right one
-            if (new Error().stack?.includes("discord.com")) {
-                logger.info("Found webpack module factory");
-                patchFactories(v);
-            }
+            delete (Function.prototype as any).O;
+        }
 
-            Object.defineProperty(this, "m", {
-                value: v,
-                configurable: true,
-            });
-        },
-        configurable: true
-    });
-}
+        Object.defineProperty(this, "O", {
+            value: onChunksLoaded,
+            configurable: true
+        });
+    },
+    configurable: true
+});
+
+// wreq.m is the webpack module factory.
+// normally, this is populated via webpackGlobal.push, which we patch below.
+// However, Discord has their .m prepopulated.
+// Thus, we use this hack to immediately access their wreq.m and patch all already existing factories
+//
+// Update: Discord now has TWO webpack instances. Their normal one and sentry
+// Sentry does not push chunks to the global at all, so this same patch now also handles their sentry modules
+Object.defineProperty(Function.prototype, "m", {
+    set(v: any) {
+        // When using react devtools or other extensions, we may also catch their webpack here.
+        // This ensures we actually got the right one
+        if (new Error().stack?.includes("discord.com")) {
+            logger.info("Found Webpack module factory");
+            patchFactories(v);
+        }
+
+        Object.defineProperty(this, "m", {
+            value: v,
+            configurable: true
+        });
+    },
+    configurable: true
+});
 
 function patchPush(webpackGlobal: any) {
     function handlePush(chunk: any) {
@@ -108,7 +140,6 @@ function patchPush(webpackGlobal: any) {
 }
 
 function patchFactories(factories: Record<string | number, (module: { exports: any; }, exports: any, require: any) => void>) {
-    const { subscriptions, listeners } = Vencord.Webpack;
     const { patches } = Vencord.Plugins;
 
     for (const id in factories) {
@@ -153,11 +184,11 @@ function patchFactories(factories: Record<string | number, (module: { exports: a
                 return;
             }
 
-            for (const callback of listeners) {
+            for (const callback of moduleListeners) {
                 try {
                     callback(exports, id);
                 } catch (err) {
-                    logger.error("Error in webpack listener", err);
+                    logger.error("Error in Webpack module listener", err);
                 }
             }
 
@@ -171,15 +202,21 @@ function patchFactories(factories: Record<string | number, (module: { exports: a
                         callback(exports.default, id);
                     }
                 } catch (err) {
-                    logger.error("Error while firing callback for webpack chunk", err);
+                    logger.error("Error while firing callback for Webpack subscription", err);
                 }
             }
         } as any as { toString: () => string, original: any, (...args: any[]): void; };
 
-        // for some reason throws some error on which calling .toString() leads to infinite recursion
-        // when you force load all chunks???
-        factory.toString = () => mod.toString();
+        factory.toString = mod.toString.bind(mod);
         factory.original = originalMod;
+
+        for (const factoryListener of factoryListeners) {
+            try {
+                factoryListener(factory);
+            } catch (err) {
+                logger.error("Error in Webpack factory listener", err);
+            }
+        }
 
         for (let i = 0; i < patches.length; i++) {
             const patch = patches[i];
