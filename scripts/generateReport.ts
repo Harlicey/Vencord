@@ -346,7 +346,7 @@ async function runtime(token: string) {
 
             if (chunkGroups == null) return;
 
-            const lazyChunks = factoryCode.matchAll(canonicalizeMatch(/\.el\("(.+?)"\)\.then\(\i\.bind\(\i,"(.+?)"\)\)/g) as RegExp);
+            const lazyChunks = factoryCode.matchAll(canonicalizeMatch(/\.el\("(.+?)"\)\.then\(\i\.bind\(\i,"(.+?)"\)\)/g));
             const validChunksEntryPoints = new Set<string>();
 
             await Promise.all(Array.from(lazyChunks).map(async ([, entryPoint, chunkGroupId]) => {
